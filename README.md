@@ -8,6 +8,11 @@ Nao foi validado em hardware. Nao grave/conecte a carga antes de confirmar a pin
 
 - GPIO27: sinal para a interface de rele existente. Padrao ativo em LOW.
 - GPIO32: leitura analogica ADC1 do NTC.
+- GPIO25: entrada dos pulsos de fluxo da entrada das placas; GPIO26: entrada dos pulsos da saida. Ambos os pinos sao entradas digitais com interrupcao.
+- Temperatura por NTC nas placas: GPIO33 (entrada) e GPIO36 (saida, somente entrada). Cada sensor usa divisor independente: 3V3 — resistor 47 kohms — pino ADC — NTC — GND. A sonda medida em cerca de 48 kohms a temperatura ambiente aparenta ser NTC; o firmware usa provisoriamente NTC nominal de 47 kohms e beta 3950, nao confirmados. Os graus sao apenas estimativas ate calibracao e nao entram no controle. O painel web mostra tambem milivolts e resistencia calculada para diagnostico.
+- Para o primeiro teste, alimente cada YF-B6 com 5 V regulados e GND comum ao ESP32, somente depois de confirmar os fios no datasheet. A especificacao informa nivel alto de pulso acima de 4,7 V: nao ligue a saida diretamente ao GPIO. Para saida push-pull de 5 V, use um divisor por sensor (12 kohms entre saida e GPIO; 22 kohms entre GPIO e GND). Nao alimente o sensor acima de 5 V com esse divisor.
+- Se a saida nao for push-pull de 5 V, ou a identificacao dos fios nao estiver clara, pare e confirme o tipo antes de ligar; a interface pode precisar ser diferente. GPIO25/26 sao apenas sinais digitais de fluxo, nao entradas para temperatura.
+- A vazao usa 396 pulsos/L como valor nominal do anuncio, atualizada a cada 2 segundos. Volume total e vazao sao exibidos no painel web; os totais de pulsos ficam salvos na memoria do ESP32 e continuam apos reiniciar. O firmware grava os totais a cada 5 minutos para limitar escritas; um corte de energia pode perder pulsos acumulados desde a ultima gravacao. A leitura 0.0 significa que nao foram contados pulsos e nao distingue fluxo parado de falha de ligacao. A temperatura interna existente no boiler segue sendo a referencia do controle.
 - Divisor: **3V3 — resistor 10 kohms 1% — GPIO32 — NTC 10 kohms B3950 — GND**.
 - Nunca aplicar 5 V ao ADC. Nao compartilhar o sensor do termostato independente.
 - Usar interface compativel com logica de 3,3 V; conferir alimentacao e referencia de terra conforme o modulo.
@@ -31,6 +36,9 @@ O painel usa a senha da rede como controle de acesso; nao possui login separado,
 
 ## Comportamento
 
+- A tela principal preserva a leitura grande do sensor que fica dentro do boiler e a meta; abaixo, reserva duas colunas para temperatura e fluxo na entrada e na saida das placas. As temperaturas dos NTCs das placas sao leituras aproximadas usando parametros provisórios; vazoes sao calculadas pelos pulsos nos GPIO25/26. Nenhuma leitura dos medidores participa do controle.
+- O painel web atualiza estado e leituras a cada 2 segundos, mostra os volumes acumulados persistentes de entrada e saida e desenha graficos ao vivo da temperatura do boiler/meta e das vazoes, com ate 4 minutos de historico enquanto a pagina fica aberta. O historico dos graficos e temporario e nao e gravado.
+- A linha inferior alterna a cada 5 segundos entre o estado do controle, a agenda ou modo manual e a conexao Wi-Fi/endereco IP. Durante o aquecimento, ou em falha, a mensagem correspondente fica fixa.
 - Botoes integrados: GPIO35 aumenta a meta em 0,5 C; GPIO0 diminui, dentro de 20 a 70 C. Nao habilitam o aquecimento.
 - A tela reduz o brilho apos 20 segundos sem tocar nos botoes, conforme `DISPLAY_IDLE_BRIGHTNESS`. O primeiro toque curto apenas acende; os seguintes ajustam ao soltar. Cada toque curto gera um passo, sem repeticao ao segurar. Dois botoes juntos nao ajustam.
 - Segurar GPIO35 (+) por 2 segundos alterna MANUAL/AUTO. Ao entrar no MANUAL, guarda a habilitacao anterior do AUTO e habilita o controle; ao voltar ao AUTO, restaura essa habilitacao e segue a agenda. A troca desliga a saida antes de reavaliar e respeita a pausa para religar. Um toque longo nao altera a meta e funciona mesmo com a tela em repouso; e necessario soltar antes de alternar novamente. No MANUAL, mantem a temperatura sem depender da agenda ou NTP. Falha do sensor e limite termico continuam valendo nos dois modos. GPIO0 longo nao tem acao.

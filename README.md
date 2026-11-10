@@ -1,4 +1,13 @@
-# Controlador de boiler — ESP32 T-Display
+# Boiler Monitor V2 — duas placas ESP32
+
+Esta branch (`v2-development`) desenvolve a V2. O estado V1 continua preservado
+no tag Git `v1-stable`; a documentacao original da V1 esta abaixo. A arquitetura, pinagem, comunicacao,
+instalacao e testes da V2 estao em [README_V2.md](README_V2.md).
+
+O restante deste arquivo e a documentacao original da V1; para operar a V2,
+use o guia acima.
+
+# Controlador de boiler — ESP32 T-Display (V1)
 
 Firmware inicial para T-Display classica ESP32 com ST7789 135 x 240.
 A TENSTAR ainda precisa ser conferida fisicamente: nao foi possivel acessar o anuncio.

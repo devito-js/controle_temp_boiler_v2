@@ -1,13 +1,16 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <WiFiUdp.h>
 #include <Preferences.h>
 #include <TFT_eSPI.h>
 #include <time.h>
 #include <math.h>
 #include "config.h"
+#include "telemetry.h"
 
 WebServer server(80);
+WiFiUDP telemetryUdp;
 Preferences prefs;
 TFT_eSPI screen;
 TFT_eSprite dashboard(&screen);
@@ -21,9 +24,16 @@ struct MeterReading {
   float temperatureOhms = NAN;
 };
 MeterReading meter1, meter2;
-volatile uint32_t inletPulseCount = 0, outletPulseCount = 0;
 uint32_t flowSampled = 0;
 uint32_t flowTotalsSavedAt = 0;
+uint32_t lastTelemetryAt = 0;
+uint32_t lastTelemetrySequence = 0;
+uint32_t lastTelemetryBootId = 0;
+uint64_t lastInletPulses = 0, lastOutletPulses = 0;
+uint64_t pendingInletPulses = 0, pendingOutletPulses = 0;
+bool haveTelemetry = false, haveTelemetryCounters = false;
+bool telemetryConnected = false;
+uint32_t rejectedTelemetryPackets = 0, lastRejectedTelemetryLog = 0;
 constexpr uint32_t FLOW_TOTALS_SAVE_INTERVAL_MS = 300000;
 bool enabled = false, relay = false, fault = false;
 bool manualMode = false;
@@ -36,9 +46,6 @@ String state = "Inicializando";
 constexpr uint8_t BACKLIGHT_CHANNEL = 0;
 uint32_t displayActivity = 0, targetChangedAt = 0;
 bool displayIdle = false, targetDirty = false;
-
-void IRAM_ATTR countInletPulse() { ++inletPulseCount; }
-void IRAM_ATTR countOutletPulse() { ++outletPulseCount; }
 
 struct Button {
   int pin;
@@ -151,46 +158,106 @@ int parseTime(const String &s) {
   int h = s.substring(0, 2).toInt(), m = s.substring(3).toInt();
   return h < 24 && m < 60 ? h * 60 + m : -1;
 }
-float readFlowTemperature(int pin, float &millivolts, float &resistanceOhms) {
-  millivolts = 0;
-  for (int i = 0; i < 16; ++i) millivolts += analogReadMilliVolts(pin);
-  millivolts /= 16;
-  if (millivolts <= 100 || millivolts >= 3000 || millivolts >= SUPPLY_MV) {
-    resistanceOhms = NAN;
-    return NAN;
+void reportRejectedTelemetry(const char *reason) {
+  ++rejectedTelemetryPackets;
+  const uint32_t now = millis();
+  if (now - lastRejectedTelemetryLog >= 5000) {
+    lastRejectedTelemetryLog = now;
+    Serial.printf("Telemetria descartada (%s); total=%lu\n", reason,
+                  static_cast<unsigned long>(rejectedTelemetryPackets));
+  }
+}
+void receiveTelemetry() {
+  while (telemetryUdp.parsePacket() > 0) {
+    const int packetSize = telemetryUdp.available();
+    if (packetSize != static_cast<int>(sizeof(BoilerTelemetry::Frame))) {
+      while (telemetryUdp.available()) telemetryUdp.read();
+      reportRejectedTelemetry("tamanho");
+      continue;
+    }
+
+    BoilerTelemetry::Frame frame{};
+    if (telemetryUdp.read(reinterpret_cast<uint8_t *>(&frame), sizeof(frame))
+        != static_cast<int>(sizeof(frame))) {
+      reportRejectedTelemetry("leitura");
+      continue;
+    }
+    if (!BoilerTelemetry::valid(frame)) {
+      reportRejectedTelemetry("CRC/cabecalho");
+      continue;
+    }
+    if (haveTelemetry && frame.bootId == lastTelemetryBootId
+        && !BoilerTelemetry::newer(frame.sequence, lastTelemetrySequence))
+      continue;
+
+    const uint32_t now = millis();
+    const bool newAcquisitionBoot = !haveTelemetry
+        || frame.bootId != lastTelemetryBootId;
+    if (haveTelemetryCounters) {
+      if (frame.inletPulses >= lastInletPulses) {
+        const uint64_t delta = frame.inletPulses - lastInletPulses;
+        meter1.totalPulses += delta;
+        if (!newAcquisitionBoot) pendingInletPulses += delta;
+      }
+      if (frame.outletPulses >= lastOutletPulses) {
+        const uint64_t delta = frame.outletPulses - lastOutletPulses;
+        meter2.totalPulses += delta;
+        if (!newAcquisitionBoot) pendingOutletPulses += delta;
+      }
+    }
+    if (newAcquisitionBoot) {
+      flowSampled = now;
+      pendingInletPulses = pendingOutletPulses = 0;
+    }
+    lastInletPulses = frame.inletPulses;
+    lastOutletPulses = frame.outletPulses;
+    lastTelemetryBootId = frame.bootId;
+    lastTelemetrySequence = frame.sequence;
+    haveTelemetryCounters = true;
+    haveTelemetry = true;
+    lastTelemetryAt = now;
+    telemetryConnected = true;
+
+    temperature = (frame.validMask & BoilerTelemetry::BOILER_VALID)
+        ? frame.temperatureCentiC[0] / 100.0f : NAN;
+    meter1.temperatureC = (frame.validMask & BoilerTelemetry::INLET_VALID)
+        ? frame.temperatureCentiC[1] / 100.0f : NAN;
+    meter2.temperatureC = (frame.validMask & BoilerTelemetry::OUTLET_VALID)
+        ? frame.temperatureCentiC[2] / 100.0f : NAN;
+    meter1.temperatureMv = frame.millivolts[1];
+    meter2.temperatureMv = frame.millivolts[2];
+    meter1.temperatureOhms = isfinite(meter1.temperatureMv)
+        && meter1.temperatureMv > 0 && meter1.temperatureMv < SUPPLY_MV
+        ? FLOW_TEMP_SERIES_OHMS * meter1.temperatureMv
+            / (SUPPLY_MV - meter1.temperatureMv) : NAN;
+    meter2.temperatureOhms = isfinite(meter2.temperatureMv)
+        && meter2.temperatureMv > 0 && meter2.temperatureMv < SUPPLY_MV
+        ? FLOW_TEMP_SERIES_OHMS * meter2.temperatureMv
+            / (SUPPLY_MV - meter2.temperatureMv) : NAN;
+
+    const uint32_t elapsed = now - flowSampled;
+    if (elapsed >= FLOW_SAMPLE_INTERVAL_MS) {
+      const float scale = 60000.0f
+          / (elapsed * static_cast<float>(FLOW_PULSES_PER_LITER));
+      meter1.flowLpm = pendingInletPulses * scale;
+      meter2.flowLpm = pendingOutletPulses * scale;
+      pendingInletPulses = pendingOutletPulses = 0;
+      flowSampled = now;
+    }
+    const float litersPerPulse = 1.0f / FLOW_PULSES_PER_LITER;
+    meter1.totalLiters = meter1.totalPulses * litersPerPulse;
+    meter2.totalLiters = meter2.totalPulses * litersPerPulse;
   }
 
-  resistanceOhms = FLOW_TEMP_SERIES_OHMS * millivolts / (SUPPLY_MV - millivolts);
-  const float kelvin = 1.0f / (1.0f / 298.15f
-      + logf(resistanceOhms / FLOW_TEMP_NTC_OHMS) / FLOW_TEMP_NTC_BETA);
-  const float celsius = kelvin - 273.15f;
-  return isfinite(celsius) && celsius >= 0 && celsius <= 110 ? celsius : NAN;
-}
-void updateFlowMeters() {
-  const uint32_t now = millis();
-  const uint32_t elapsed = now - flowSampled;
-  if (elapsed < FLOW_SAMPLE_INTERVAL_MS) return;
-
-  noInterrupts();
-  const uint32_t inletPulses = inletPulseCount;
-  const uint32_t outletPulses = outletPulseCount;
-  inletPulseCount = 0;
-  outletPulseCount = 0;
-  interrupts();
-
-  const float litersPerPulse = 1.0f / FLOW_PULSES_PER_LITER;
-  const float minutesPerMillisecond = 60000.0f / elapsed;
-  meter1.flowLpm = inletPulses * litersPerPulse * minutesPerMillisecond;
-  meter2.flowLpm = outletPulses * litersPerPulse * minutesPerMillisecond;
-  meter1.totalPulses += inletPulses;
-  meter2.totalPulses += outletPulses;
-  meter1.totalLiters = meter1.totalPulses * litersPerPulse;
-  meter2.totalLiters = meter2.totalPulses * litersPerPulse;
-  meter1.temperatureC = readFlowTemperature(FLOW_INLET_TEMP_PIN,
-      meter1.temperatureMv, meter1.temperatureOhms);
-  meter2.temperatureC = readFlowTemperature(FLOW_OUTLET_TEMP_PIN,
-      meter2.temperatureMv, meter2.temperatureOhms);
-  flowSampled = now;
+  telemetryConnected = haveTelemetry
+      && millis() - lastTelemetryAt <= BoilerTelemetry::TIMEOUT_MS;
+  if (!telemetryConnected) {
+    temperature = NAN;
+    meter1.temperatureC = meter2.temperatureC = NAN;
+    meter1.flowLpm = meter2.flowLpm = NAN;
+    meter1.temperatureMv = meter2.temperatureMv = NAN;
+    meter1.temperatureOhms = meter2.temperatureOhms = NAN;
+  }
 }
 void saveFlowTotalsIfDue() {
   const uint32_t now = millis();
@@ -202,22 +269,20 @@ void saveFlowTotalsIfDue() {
   if (meter2.totalPulses != prefs.getULong64("outPulses", 0)
       && prefs.putULong64("outPulses", meter2.totalPulses) != sizeof(meter2.totalPulses))
     Serial.println("Erro ao salvar volume acumulado da saida");
+  const size_t savedInletReference = prefs.putULong64("rxIn", lastInletPulses);
+  const size_t savedOutletReference = prefs.putULong64("rxOut", lastOutletPulses);
+  if (savedInletReference != sizeof(lastInletPulses)
+      || savedOutletReference != sizeof(lastOutletPulses))
+    Serial.println("Erro ao salvar referencia dos pulsos recebidos");
 }
 void control() {
-  float mv = 0;
-  for (int i = 0; i < 16; ++i) mv += analogReadMilliVolts(NTC_PIN);
-  mv /= 16;
-  bool valid = mv > 100 && mv < 3000 && mv < SUPPLY_MV;
-  temperature = NAN;
-  if (valid) {
-    float r = SERIES_OHMS * mv / (SUPPLY_MV - mv);
-    temperature = 1 / (1 / 298.15f + logf(r / NTC_OHMS) / NTC_BETA) - 273.15f;
-    valid = isfinite(temperature) && temperature >= 0 && temperature <= 110;
-  }
+  const bool valid = telemetryConnected
+      && isfinite(temperature) && temperature >= 0 && temperature <= 110;
   if (!valid || temperature >= MAX_TEMP) fault = true;
   goodSamples = valid ? min(goodSamples + 1, 10u) : 0;
   bool demand = false;
-  if (fault) state = "FALHA: sensor/temperatura";
+  if (fault) state = telemetryConnected
+      ? "FALHA: sensor/temperatura" : "FALHA: comunicacao/sensor";
   else if (goodSamples < 5) state = "Validando sensor";
   else if (!enabled) state = "Controle desabilitado";
   else if (!manualMode && !clockReady()) state = "Aguardando horario NTP";
@@ -240,7 +305,7 @@ h1,h2{margin:.5em 0}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1
 @media(max-width:480px){body{margin:0;padding:12px}.grid{gap:8px}.card{padding:10px}.value{font-size:1.3em}canvas{height:190px}}
 </style></head><body><h1>Controle do boiler</h1><div class='grid'>
 <section class='card'><div class='muted'>Temperatura do boiler</div><div class='value'><span id='boilerTemp'>--</span> &deg;C</div><div class='muted'>Meta: <span id='targetRead'>--</span> &deg;C</div></section>
-<section class='card'><div class='muted'>Estado / modo</div><div class='status' id='state'>Carregando...</div><div id='mode'>--</div><div class='muted'>Rele: <span id='relay'>--</span> | Horario: <span id='clock'>--</span><br>Agenda: <span id='schedule'>--</span><br>Rede: <span id='wifi'>--</span></div></section>
+<section class='card'><div class='muted'>Estado / modo</div><div class='status' id='state'>Carregando...</div><div id='mode'>--</div><div class='muted'>Rele: <span id='relay'>--</span> | Horario: <span id='clock'>--</span><br>Agenda: <span id='schedule'>--</span><br>Rede: <span id='wifi'>--</span><br>Aquisicao: <span id='sensorLink'>--</span></div></section>
 <section class='card'><div class='muted'>Entrada das placas</div><div class='value'><span id='inTemp'>--.-</span> &deg;C</div><div>Fluxo: <span id='inFlow'>--.-</span> L/min</div><div class='muted'>Volume acumulado: <span id='inLiters'>0.00</span> L</div><div class='muted'>ADC: <span id='inTempDiag'>--</span></div></section>
 <section class='card'><div class='muted'>Saida das placas</div><div class='value'><span id='outTemp'>--.-</span> &deg;C</div><div>Fluxo: <span id='outFlow'>--.-</span> L/min</div><div class='muted'>Volume acumulado: <span id='outLiters'>0.00</span> L</div><div class='muted'>ADC: <span id='outTempDiag'>--</span></div></section>
 <section class='card wide'><h2>Temperatura do boiler</h2><div class='muted'>Historico ao vivo: ultimos 4 minutos, enquanto esta pagina permanecer aberta.</div><canvas id='chart' aria-label='Grafico de temperatura'></canvas></section>
@@ -249,7 +314,7 @@ h1,h2{margin:.5em 0}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1
   h += "<p id='outputInfo'>Saida GPIO" + String(RELAY_PIN) + ": " + String(digitalRead(RELAY_PIN) == HIGH ? "HIGH" : "LOW")
      + " | Rele configurado ativo em " + String(RELAY_ACTIVE_LOW ? "LOW" : "HIGH")
      + ". O estado fisico do rele nao e monitorado.</p>";
-  h += "<p>Fluxo: entrada GPIO" + String(FLOW_INLET_PIN) + ", saida GPIO" + String(FLOW_OUTLET_PIN)
+  h += "<p>Fluxo na aquisicao: entrada GPIO" + String(FLOW_INLET_PIN) + ", saida GPIO" + String(FLOW_OUTLET_PIN)
      + ", nominal " + String(FLOW_PULSES_PER_LITER) + " pulsos/L. Leitura 0.0 significa que nao foram contados pulsos; nao distingue ausencia de fluxo de problema de ligacao.</p>";
   h += "<form method='post' action='/save'><label>Temperatura meta (&deg;C)<br><input name='target' type='number' min='20' max='70' step='0.5' required value='" + String(target, 1) + "'></label>";
   h += "<label>Inicio diario<br><input name='start' type='time' required value='" + hhmm(startMinute) + "'></label><label>Fim diario<br><input name='stop' type='time' required value='" + hhmm(stopMinute) + "'></label>";
@@ -261,7 +326,9 @@ function drawChart(target){const dpr=window.devicePixelRatio||1;const w=canvas.c
 function fmt(v){return Number.isFinite(v)?v.toFixed(1):'--.-'}
 function drawFlowChart(){const dpr=window.devicePixelRatio||1;const w=flowCanvas.clientWidth,h=flowCanvas.clientHeight;if(!w||!h)return;flowCanvas.width=w*dpr;flowCanvas.height=h*dpr;flowCtx.setTransform(dpr,0,0,dpr,0,0);flowCtx.clearRect(0,0,w,h);const pad={l:42,r:12,t:12,b:24},cw=w-pad.l-pad.r,ch=h-pad.t-pad.b;const vals=samples.flatMap(p=>[p.fi,p.fo]).filter(Number.isFinite);if(!vals.length){flowCtx.fillStyle='#567';flowCtx.fillText('Aguardando pulsos dos medidores',pad.l,35);return}const hi=Math.max(1,Math.ceil(Math.max(...vals))),x=i=>pad.l+(samples.length<2?0:i/(samples.length-1))*cw,y=v=>pad.t+(hi-v)/hi*ch;flowCtx.font='12px system-ui';flowCtx.strokeStyle='#d5e0e8';flowCtx.fillStyle='#567';for(let i=0;i<=4;i++){const v=hi*i/4,yy=y(v);flowCtx.beginPath();flowCtx.moveTo(pad.l,yy);flowCtx.lineTo(w-pad.r,yy);flowCtx.stroke();flowCtx.fillText(v.toFixed(1),2,yy+4)}for(const [key,color] of [['fi','#08a9c2'],['fo','#e49a32']]){flowCtx.strokeStyle=color;flowCtx.lineWidth=2;flowCtx.beginPath();let started=false;samples.forEach((p,i)=>{if(!Number.isFinite(p[key]))return;const xx=x(i),yy=y(p[key]);if(!started){flowCtx.moveTo(xx,yy);started=true}else flowCtx.lineTo(xx,yy)});flowCtx.stroke()}flowCtx.fillStyle='#567';flowCtx.fillText('agora',w-44,h-4);flowCtx.fillText('4 min',pad.l,h-4)}
 async function update(){try{const r=await fetch('/data',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();document.getElementById('boilerTemp').textContent=fmt(d.boiler);document.getElementById('targetRead').textContent=fmt(d.target);document.getElementById('inTemp').textContent=fmt(d.inTemp);document.getElementById('outTemp').textContent=fmt(d.outTemp);document.getElementById('inFlow').textContent=fmt(d.inFlow);document.getElementById('outFlow').textContent=fmt(d.outFlow);document.getElementById('inLiters').textContent=fmt(d.inLiters);document.getElementById('outLiters').textContent=fmt(d.outLiters);document.getElementById('inTempDiag').textContent=fmt(d.inTempMv)+' mV / '+fmt(d.inTempOhms/1000)+' kΩ';document.getElementById('outTempDiag').textContent=fmt(d.outTempMv)+' mV / '+fmt(d.outTempOhms/1000)+' kΩ';document.getElementById('state').textContent=d.state;document.getElementById('state').style.color=d.fault?'#b42318':d.relay?'#b85c00':'#087c58';document.getElementById('mode').textContent=d.mode;document.getElementById('relay').textContent=d.relay?'LIGADO':'DESLIGADO';document.getElementById('clock').textContent=d.clock||'sem NTP';document.getElementById('schedule').textContent=d.start+' - '+d.stop;document.getElementById('wifi').textContent=d.wifi?'Conectado: '+d.ip:'Ponto de acesso: '+d.ip;samples.push({t:d.boiler,fi:d.inFlow,fo:d.outFlow});if(samples.length>120)samples.shift();drawChart(d.target);drawFlowChart()}catch(e){document.getElementById('state').textContent='Sem comunicacao com o controlador';document.getElementById('state').style.color='#b42318'}}
+async function updateSensorLink(){try{const r=await fetch('/data',{cache:'no-store'});if(!r.ok)return;const d=await r.json();const el=document.getElementById('sensorLink');el.textContent=d.sensorLink?'online':'SEM COMUNICACAO';el.style.color=d.sensorLink?'#087c58':'#b42318'}catch(e){document.getElementById('sensorLink').textContent='indisponivel'}}
 window.addEventListener('resize',()=>{drawChart(NaN);drawFlowChart()});update();setInterval(update,2000);
+updateSensorLink();setInterval(updateSensorLink,2000);
 </script></body></html>)rawliteral");
   server.sendHeader("Cache-Control", "no-store"); server.send(200, "text/html; charset=utf-8", h);
 }
@@ -345,13 +412,14 @@ void drawDashboard() {
 
 void setup() {
   digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW); pinMode(RELAY_PIN, OUTPUT); output(false);
-  Serial.begin(115200); analogReadResolution(12); analogSetPinAttenuation(NTC_PIN, ADC_11db);
-  analogSetPinAttenuation(FLOW_INLET_TEMP_PIN, ADC_11db);
-  analogSetPinAttenuation(FLOW_OUTLET_TEMP_PIN, ADC_11db);
+  Serial.begin(115200);
   prefs.begin("boiler", false);
   target = prefs.getFloat("target", 50); startMinute = prefs.getInt("start", 360); stopMinute = prefs.getInt("stop", 480);
   meter1.totalPulses = prefs.getULong64("inPulses", 0);
   meter2.totalPulses = prefs.getULong64("outPulses", 0);
+  lastInletPulses = prefs.getULong64("rxIn", 0);
+  lastOutletPulses = prefs.getULong64("rxOut", 0);
+  haveTelemetryCounters = true;
   meter1.totalLiters = meter1.totalPulses / static_cast<float>(FLOW_PULSES_PER_LITER);
   meter2.totalLiters = meter2.totalPulses / static_cast<float>(FLOW_PULSES_PER_LITER);
   if (!isfinite(target) || target < 20 || target > 70) target = 50;
@@ -361,10 +429,6 @@ void setup() {
   ledcSetup(BACKLIGHT_CHANNEL, 5000, 8);
   ledcAttachPin(TFT_BL, BACKLIGHT_CHANNEL);
   upButton.begin(); downButton.begin();
-  pinMode(FLOW_INLET_PIN, INPUT);
-  pinMode(FLOW_OUTLET_PIN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(FLOW_INLET_PIN), countInletPulse, RISING);
-  attachInterrupt(digitalPinToInterrupt(FLOW_OUTLET_PIN), countOutletPulse, RISING);
   wakeDisplay();
   dashboard.setColorDepth(16);
   if (!dashboard.createSprite(240, 135)) {
@@ -373,6 +437,7 @@ void setup() {
     Serial.println("Falha ao alocar painel da tela");
   }
   WiFi.mode(WIFI_AP_STA); WiFi.softAP(AP_NAME, AP_PASSWORD);
+  telemetryUdp.begin(BoilerTelemetry::UDP_PORT);
   String ssid = prefs.getString("ssid", "");
   if (ssid.length()) WiFi.begin(ssid.c_str(), prefs.getString("password", "").c_str());
   configTime(-10800, 0, "pool.ntp.org", "time.google.com");
@@ -402,6 +467,7 @@ void setup() {
         + ",\"clock\":\"" + clock + "\""
         + ",\"start\":\"" + hhmm(startMinute) + "\",\"stop\":\"" + hhmm(stopMinute) + "\""
         + ",\"wifi\":" + (WiFi.status() == WL_CONNECTED ? "true" : "false")
+        + ",\"sensorLink\":" + (telemetryConnected ? "true" : "false")
         + ",\"ip\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + "\"}";
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "application/json; charset=utf-8", json);
@@ -430,7 +496,7 @@ void setup() {
 }
 void loop() {
   handleButtonsAndBacklight();
-  updateFlowMeters();
+  receiveTelemetry();
   saveFlowTotalsIfDue();
   if (millis() - sampled >= 500) { sampled = millis(); control(); }
   server.handleClient();

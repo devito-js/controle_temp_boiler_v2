@@ -17,6 +17,10 @@ constexpr bool RELAY_ACTIVE_LOW = true;
 constexpr float SERIES_OHMS = 10000.0f;
 constexpr float NTC_OHMS = 10000.0f;
 constexpr float NTC_BETA = 3950.0f;
+// Offsets em zero ate comparar com termometro de referencia.
+constexpr float BOILER_TEMP_OFFSET_C = 0.0f;
+constexpr float INLET_TEMP_OFFSET_C = 0.0f;
+constexpr float OUTLET_TEMP_OFFSET_C = 0.0f;
 constexpr float SUPPLY_MV = 3300.0f;
 constexpr float MAX_TEMP = 75.0f;
 constexpr float HYSTERESIS = 2.0f;
